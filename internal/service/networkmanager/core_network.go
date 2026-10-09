@@ -59,6 +59,8 @@ func resourceCoreNetwork() *schema.Resource {
 			StateContext: schema.ImportStatePassthroughContext,
 		},
 
+		CustomizeDiff: resourceCoreNetworkCustomizeDiff,
+
 		Timeouts: &schema.ResourceTimeout{
 			Create: schema.DefaultTimeout(30 * time.Minute),
 			Update: schema.DefaultTimeout(30 * time.Minute),
@@ -83,21 +85,24 @@ func resourceCoreNetwork() *schema.Resource {
 						json, _ := structure.NormalizeJsonString(v)
 						return json
 					},
-					ConflictsWith: []string{"base_policy_regions"},
+					ConflictsWith: []string{"base_policy_regions", "policy_document"},
 				},
 				"base_policy_regions": {
+					Deprecated: "base_policy_regions is deprecated. Use base_policy_document instead. " +
+						"This argument will be removed in the next major version of the provider.",
 					Type:     schema.TypeSet,
 					Optional: true,
 					Elem: &schema.Schema{
 						Type:         schema.TypeString,
 						ValidateFunc: verify.ValidRegionName,
 					},
-					ConflictsWith: []string{"base_policy_document"},
+					ConflictsWith: []string{"base_policy_document", "policy_document"},
 				},
 				"create_base_policy": {
-					Type:     schema.TypeBool,
-					Optional: true,
-					Default:  false,
+					Type:          schema.TypeBool,
+					Optional:      true,
+					Default:       false,
+					ConflictsWith: []string{"policy_document"},
 				},
 				names.AttrCreatedAt: {
 					Type:     schema.TypeString,
@@ -134,6 +139,20 @@ func resourceCoreNetwork() *schema.Resource {
 					Required:     true,
 					ForceNew:     true,
 					ValidateFunc: validation.StringLenBetween(0, 50),
+				},
+				"policy_document": {
+					Type:     schema.TypeString,
+					Optional: true,
+					ValidateFunc: validation.All(
+						validation.StringLenBetween(0, 10000000),
+						validation.StringIsJSON,
+					),
+					DiffSuppressFunc: verify.SuppressEquivalentJSONDiffs,
+					StateFunc: func(v any) string {
+						json, _ := structure.NormalizeJsonString(v)
+						return json
+					},
+					ConflictsWith: []string{"base_policy_document", "base_policy_regions", "create_base_policy"},
 				},
 				"segments": {
 					Type:     schema.TypeList,
@@ -184,9 +203,18 @@ func resourceCoreNetworkCreate(ctx context.Context, d *schema.ResourceData, meta
 		input.Description = aws.String(v.(string))
 	}
 
+	// if the user supplies a full policy document at create time, the core network
+	// is created with that policy set to LIVE. This conflicts with create_base_policy
+	// as no interim base policy is needed when the policy document does not reference
+	// attachment IDs or prefix list associations.
+	if v, ok := d.GetOk("policy_document"); ok {
+		input.PolicyDocument = aws.String(v.(string))
+	}
+
 	// check if the user wants to create a base policy document
 	// this creates the core network with a starting policy document set to LIVE
 	// this is required for the first terraform apply if there attachments to the core network
+	// and the policy document references attachment IDs or prefix list associations
 	if _, ok := d.GetOk("create_base_policy"); ok {
 		// if user supplies a full base_policy_document for maximum flexibility, use it. Otherwise, use regions list
 		// var policyDocumentTarget string
@@ -255,6 +283,27 @@ func resourceCoreNetworkRead(ctx context.Context, d *schema.ResourceData, meta a
 	}
 	d.Set(names.AttrState, coreNetwork.State)
 
+	// policy_document is optional. The policy may instead be managed by the
+	// aws_networkmanager_core_network_policy_attachment resource, so only refresh
+	// policy_document when it is managed by this resource (i.e. already in state).
+	if _, ok := d.GetOk("policy_document"); ok {
+		// getting the policy document uses a different API call
+		// pass in latestPolicyVersionId to get the latest version id by default
+		coreNetworkPolicy, err := findCoreNetworkPolicyByTwoPartKey(ctx, conn, d.Id(), latestPolicyVersionID)
+		switch {
+		case retry.NotFound(err):
+			d.Set("policy_document", nil)
+		case err != nil:
+			return sdkdiag.AppendErrorf(diags, "reading Network Manager Core Network (%s) policy: %s", d.Id(), err)
+		default:
+			encodedPolicyDocument, err := structure.NormalizeJsonString(aws.ToString(coreNetworkPolicy.PolicyDocument))
+			if err != nil {
+				return sdkdiag.AppendFromErr(diags, err)
+			}
+			d.Set("policy_document", encodedPolicyDocument)
+		}
+	}
+
 	setTagsOut(ctx, coreNetwork.Tags)
 
 	return diags
@@ -274,6 +323,18 @@ func resourceCoreNetworkUpdate(ctx context.Context, d *schema.ResourceData, meta
 
 		if err != nil {
 			return sdkdiag.AppendErrorf(diags, "updating Network Manager Core Network (%s): %s", d.Id(), err)
+		}
+
+		if _, err := waitCoreNetworkUpdated(ctx, conn, d.Id(), d.Timeout(schema.TimeoutUpdate)); err != nil {
+			return sdkdiag.AppendErrorf(diags, "waiting for Network Manager Core Network (%s) update: %s", d.Id(), err)
+		}
+	}
+
+	if d.HasChange("policy_document") {
+		err := putAndExecuteCoreNetworkPolicy(ctx, conn, d.Id(), d.Get("policy_document").(string))
+
+		if err != nil {
+			return sdkdiag.AppendFromErr(diags, err)
 		}
 
 		if _, err := waitCoreNetworkUpdated(ctx, conn, d.Id(), d.Timeout(schema.TimeoutUpdate)); err != nil {
@@ -334,6 +395,17 @@ func resourceCoreNetworkDelete(ctx context.Context, d *schema.ResourceData, meta
 	}
 
 	return diags
+}
+
+func resourceCoreNetworkCustomizeDiff(_ context.Context, d *schema.ResourceDiff, meta any) error {
+	if d.HasChange("policy_document") {
+		if o, n := d.GetChange("policy_document"); !verify.JSONStringsEqual(o.(string), n.(string)) {
+			d.SetNewComputed("edges")
+			d.SetNewComputed("segments")
+		}
+	}
+
+	return nil
 }
 
 func findCoreNetworkByID(ctx context.Context, conn *networkmanager.Client, id string) (*awstypes.CoreNetwork, error) {
